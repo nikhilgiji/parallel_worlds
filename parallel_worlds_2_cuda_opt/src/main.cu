@@ -1,6 +1,7 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 
@@ -43,6 +44,8 @@ __host__ int main(int argc, const char** argv) {
 	unsigned char *dEffectFrame = nullptr;
 	const bool hasDisplay = std::getenv("DISPLAY") != nullptr
 			|| std::getenv("WAYLAND_DISPLAY") != nullptr;
+	std::size_t frameCount = 0;
+	double totalMs = 0.0;
 
 	SAFE_CALL(cudaMalloc(reinterpret_cast<void**>(&dFrame), colorBytes));
 	SAFE_CALL(cudaMalloc(reinterpret_cast<void**>(&dGreyFrame), greyBytes));
@@ -54,30 +57,46 @@ __host__ int main(int argc, const char** argv) {
 		cv::namedWindow("effect", 0);
 	}
 
-	if (!hasDisplay) {
+	auto runPipeline = [&]() {
+		const auto start = std::chrono::steady_clock::now();
 		SAFE_CALL(cudaMemcpy(dFrame, frame.data, colorBytes, cudaMemcpyHostToDevice));
 		greyFilter.applyDevice(dFrame, dGreyFrame, w, h);
 		sobelFilter.applyDevice(dGreyFrame, dEdgeFrame, w, h, .5f);
 		effectFilter.applyDevice(dFrame, dEdgeFrame, dEffectFrame, w, h, 90.0f);
+		SAFE_CALL(cudaMemcpy(edgeFrame.data, dEdgeFrame, greyBytes, cudaMemcpyDeviceToHost));
 		SAFE_CALL(cudaMemcpy(effectFrame.data, dEffectFrame, colorBytes, cudaMemcpyDeviceToHost));
 		SAFE_CALL(cudaDeviceSynchronize());
+		const auto end = std::chrono::steady_clock::now();
+		const double frameMs = std::chrono::duration<double, std::milli>(end - start).count();
+		totalMs += frameMs;
+		++frameCount;
+		if (frameCount % 30 == 0) {
+			std::cout << "Average pipeline time over " << frameCount
+					<< " frames: " << (totalMs / frameCount) << " ms" << std::endl;
+		}
+		return frameMs;
+	};
 
+	if (!hasDisplay) {
+		const double frameMs = runPipeline();
+
+		if (!cv::imwrite("sobel_output.png", edgeFrame)) {
+			std::cerr << "Could not write sobel_output.png" << std::endl;
+			return 4;
+		}
 		if (!cv::imwrite("effect_output.png", effectFrame)) {
 			std::cerr << "Could not write effect_output.png" << std::endl;
 			return 4;
 		}
+		std::cout << "No display detected. Wrote sobel_output.png" << std::endl;
 		std::cout << "No display detected. Wrote effect_output.png" << std::endl;
+		std::cout << "Pipeline time: " << frameMs << " ms" << std::endl;
 	} else {
 		while (((char)cv::waitKey(10)) <= -1) {
 			if (cameraOn && !capture.read(frame))
 				exit(3);
 
-			SAFE_CALL(cudaMemcpy(dFrame, frame.data, colorBytes, cudaMemcpyHostToDevice));
-			greyFilter.applyDevice(dFrame, dGreyFrame, w, h);
-			sobelFilter.applyDevice(dGreyFrame, dEdgeFrame, w, h, .5f);
-			effectFilter.applyDevice(dFrame, dEdgeFrame, dEffectFrame, w, h, 90.0f);
-			SAFE_CALL(cudaMemcpy(effectFrame.data, dEffectFrame, colorBytes, cudaMemcpyDeviceToHost));
-			SAFE_CALL(cudaDeviceSynchronize());
+			runPipeline();
 
 			cv::imshow("preview", frame);
 			cv::imshow("effect", effectFrame);
